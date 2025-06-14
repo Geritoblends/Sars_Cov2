@@ -1,0 +1,359 @@
+# COVID-19 Variant Analysis: Spike Protein Mutations
+
+This analysis compares the spike protein sequences of different COVID-19 variants against the original Wuhan reference strain to identify key mutations.
+
+## Setup and Libraries
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 12, fig.height = 8)
+```
+
+```{r libraries}
+# Load required libraries for sequence analysis and visualization
+library(seqinr)      # DNA/protein sequence analysis
+library(dplyr)       # Data manipulation
+library(ggplot2)     # Data visualization
+library(Biostrings)  # Bioconductor sequence handling
+library(pwalign)     # Pairwise sequence alignment
+library(foreach)     # Parallel processing
+library(future)      # Parallel backend
+library(doFuture)    # Future adapter for foreach
+
+# Setup parallel processing
+plan(multicore)      # More stable than multicore for Biostrings
+registerDoFuture()
+
+# Set random seed for reproducibility
+set.seed(123)
+```
+
+## File Configuration
+
+```{r file_paths}
+# Define file paths for reference and variant sequences
+ref_file <- "wuhan.fasta"
+variant_files <- c(
+  "alpha.fasta",
+  "beta.fasta", 
+  "gamma.fasta",
+  "delta.fasta",
+  "omicronba1.fasta",
+  "omicronba2.fasta",
+  "omicronjn1.fasta"
+)
+
+# Create variant names for labeling
+variant_names <- gsub(".fasta$", "", basename(variant_files))
+```
+
+## Helper Functions
+
+### Sequence Cleaning Function
+This function removes problematic characters from DNA sequences, replacing them with 'A' to maintain sequence length.
+
+```{r clean_function}
+clean_seq <- function(seq) {
+  # Replace any non-standard nucleotides (not A, C, T, G, U) with 'A'
+  gsub("[^ACTGUactgu]", "A", seq)
+}
+```
+
+### Surface Glycoprotein Extraction
+Extracts spike protein (surface glycoprotein) sequences from FASTA files and limits to first 10 sequences per variant.
+
+```{r extract_function}
+extract_surface_glycoproteins <- function(filepath, max_seqs = 10) {
+  # Read FASTA file
+  fasta_seqs <- read.fasta(filepath, seqtype = "DNA", as.string = TRUE, whole.header = TRUE)
+  headers <- names(fasta_seqs)
+  
+  # Find sequences containing "surface glycoprotein" in header
+  is_surface <- grepl("\\|surface glycoprotein", headers)
+  
+  if (sum(is_surface) == 0) {
+    stop("No surface glycoprotein genes found in the file")
+  }
+  
+  # Extract surface glycoprotein sequences
+  surface_seqs <- fasta_seqs[is_surface]
+  
+  # Limit to first max_seqs sequences
+  if (length(surface_seqs) > max_seqs) {
+    surface_seqs <- surface_seqs[1:max_seqs]
+    cat(sprintf("Limited to first %d sequences from %s\n", max_seqs, basename(filepath)))
+  }
+  
+  sequences <- unlist(surface_seqs)
+  names(sequences) <- names(surface_seqs)
+  return(sequences)
+}
+```
+
+### Sequence Alignment Function
+Performs global pairwise alignment using the Needleman-Wunsch algorithm.
+
+```{r alignment_function}
+needleman_wunsch <- function(ref_seq, var_seq) {
+  # Clean and convert sequences to DNAString objects
+  ref_seq <- DNAString(clean_seq(ref_seq))
+  var_seq <- DNAString(clean_seq(var_seq))
+  
+  # Define nucleotide substitution matrix
+  dna_mat <- nucleotideSubstitutionMatrix(match = 1, mismatch = -1, baseOnly = FALSE)
+  
+  # Perform global pairwise alignment
+  alignment <- pairwiseAlignment(
+    pattern = var_seq,
+    subject = ref_seq,
+    substitutionMatrix = dna_mat,
+    gapOpening = -0.5,
+    gapExtension = -0.5,
+    type = "global"
+  )
+  
+  # Extract aligned sequences
+  aln_ref <- as.character(subject(alignment))
+  aln_var <- as.character(pattern(alignment))
+  
+  return(c(aln_ref, aln_var))
+}
+```
+
+### Mutation Detection Function
+Compares aligned sequences codon by codon to identify amino acid changes. **Fixed mutation position calculation**.
+
+```{r comparison_function}
+compare_sequences <- function(ref_seq, var_seq, variant_name) {
+  # Align sequences
+  aligned <- needleman_wunsch(ref_seq, var_seq)
+  aln_ref <- aligned[1]
+  aln_var <- aligned[2]
+  
+  # Ensure sequence length is divisible by 3 (complete codons)
+  len <- min(nchar(aln_ref), nchar(aln_var))
+  len <- len - (len %% 3)
+  
+  result <- list()
+  idx <- 0
+  
+  # Compare sequences codon by codon
+  for (i in seq(1, len, by = 3)) {
+    ref_codon <- substr(aln_ref, i, i + 2)
+    var_codon <- substr(aln_var, i, i + 2)
+    
+    # Skip if codons contain gaps or are identical
+    if (grepl("-", ref_codon) | grepl("-", var_codon) | ref_codon == var_codon) next
+    
+    # Translate codons to amino acids
+    ref_aa <- seqinr::translate(s2c(ref_codon))
+    var_aa <- seqinr::translate(s2c(var_codon))
+    
+    # Determine mutation type
+    mut_type <- ifelse(ref_aa == var_aa, "synonymous", "non-synonymous")
+    
+    # FIXED: Calculate proper amino acid position
+    aa_position <- ceiling(i / 3)  # Use ceiling to get integer position
+    
+    idx <- idx + 1
+    result[[idx]] <- data.frame(
+      aa_position = aa_position,
+      ref_codon = ref_codon,
+      var_codon = var_codon,
+      ref_aa = ref_aa,
+      var_aa = var_aa,
+      aa_change = paste0(ref_aa, aa_position, var_aa),  # Now uses integer position
+      type = mut_type,
+      variant = variant_name,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  if (idx == 0) return(NULL)
+  return(bind_rows(result))
+}
+```
+
+## Data Processing
+
+### Load Reference Sequence
+```{r load_reference}
+# Load Wuhan reference spike protein sequence
+cat("Loading reference sequence...\n")
+ref_seq <- extract_surface_glycoproteins(ref_file, max_seqs = 1)[[1]]
+cat(sprintf("Reference sequence loaded: %d nucleotides\n", nchar(ref_seq)))
+```
+
+### Analyze All Variants
+```{r analyze_variants}
+# Initialize storage for mutations
+mutations_list <- list()
+
+cat("Analyzing variants...\n")
+for (file in variant_files) {
+  variant_name <- gsub(".fasta$", "", basename(file))
+  cat(sprintf("Processing %s...\n", variant_name))
+  
+  # Load variant sequences (first 10 only)
+  variant_data <- extract_surface_glycoproteins(file, max_seqs = 10)
+  
+  # Compare each variant sequence against reference using parallel processing
+  variant_mutations <- foreach(i = seq_along(variant_data), .combine = rbind) %dofuture% {
+    var_seq <- variant_data[[i]]
+    compare_sequences(ref_seq, var_seq, variant_name)
+  }
+  
+  # Store mutations for this variant
+  if (!is.null(variant_mutations) && nrow(variant_mutations) > 0) {
+    mutations_list[[variant_name]] <- variant_mutations
+  }
+  
+  cat(sprintf("  Completed analysis for %s\n", variant_name))
+}
+
+# Combine all mutation data
+mutations <- bind_rows(mutations_list)
+cat(sprintf("\nTotal mutations identified: %d\n", nrow(mutations)))
+```
+
+## Results Summary
+
+### Mutation Overview
+```{r mutation_summary}
+# Summary statistics
+summary_stats <- mutations %>%
+  group_by(variant, type) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Create summary table manually
+variant_summary <- summary_stats %>%
+  group_by(variant) %>%
+  summarise(
+    nonsynonymous = sum(count[type == "non-synonymous"]),
+    synonymous = sum(count[type == "synonymous"]),
+    total = sum(count),
+    nonsynonymous_pct = round((nonsynonymous / total) * 100, 1),
+    .groups = "drop"
+  )
+
+print(variant_summary)
+```
+
+### Top Mutations by Variant
+```{r top_mutations}
+# Find most frequent mutations per variant
+top_mutations <- mutations %>%
+  filter(type == "non-synonymous") %>%  # Focus on non-synonymous mutations
+  group_by(variant, aa_change) %>%
+  summarise(frequency = n(), .groups = "drop") %>%
+  group_by(variant) %>%
+  slice_max(order_by = frequency, n = 8) %>%  # Top 8 for cleaner visualization
+  ungroup() %>%
+  arrange(variant, desc(frequency))
+
+# Display top mutations table
+top_mutations %>%
+  group_by(variant) %>%
+  slice_head(n = 5) %>%
+  print()
+```
+
+## Visualization
+
+### Enhanced Mutation Frequency Plot
+```{r mutation_plot, fig.width=14, fig.height=10}
+# Create an enhanced visualization
+p1 <- ggplot(top_mutations, aes(x = reorder(aa_change, frequency), 
+                                y = frequency, fill = variant)) +
+  geom_col(alpha = 0.8, width = 0.7) +
+  coord_flip() +
+  facet_wrap(~variant, scales = "free", ncol = 2) +
+  scale_fill_brewer(type = "qual", palette = "Set2") +
+  labs(
+    title = "Most Frequent Non-synonymous Spike Protein Mutations by COVID-19 Variant",
+    subtitle = "Analysis of first 10 sequences per variant compared to Wuhan reference",
+    x = "Amino Acid Change",
+    y = "Frequency",
+    caption = "Format: [Original AA][Position][New AA] (e.g., D614G = Aspartic acid → Glycine at position 614)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12, color = "gray40"),
+    strip.text = element_text(size = 11, face = "bold"),
+    axis.text.y = element_text(size = 9),
+    axis.text.x = element_text(size = 10),
+    plot.caption = element_text(size = 9, color = "gray50")
+  )
+
+print(p1)
+```
+
+### Mutation Position Distribution
+```{r position_plot, fig.width=12, fig.height=6}
+# Plot showing mutation positions across the spike protein
+p2 <- mutations %>%
+  filter(type == "non-synonymous") %>%
+  ggplot(aes(x = aa_position, fill = variant)) +
+  geom_histogram(bins = 50, alpha = 0.7, position = "identity") +
+  facet_wrap(~variant, ncol = 2) +
+  scale_fill_viridis_d(option = "plasma") +
+  labs(
+    title = "Distribution of Non-synonymous Mutations Along Spike Protein",
+    x = "Amino Acid Position",
+    y = "Number of Mutations",
+    subtitle = "Shows where mutations cluster in the spike protein sequence"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "bold")
+  )
+
+print(p2)
+```
+
+## Key Findings
+
+```{r key_findings}
+# Identify shared mutations across variants
+shared_mutations <- mutations %>%
+  filter(type == "non-synonymous") %>%
+  group_by(aa_change) %>%
+  summarise(
+    variants = paste(unique(variant), collapse = ", "),
+    variant_count = n_distinct(variant),
+    total_frequency = n(),
+    .groups = "drop"
+  ) %>%
+  filter(variant_count >= 3) %>%  # Mutations in 3+ variants
+  arrange(desc(variant_count), desc(total_frequency))
+
+cat("## Mutations Found in Multiple Variants\n")
+if (nrow(shared_mutations) > 0) {
+  print(head(shared_mutations, 10))
+} else {
+  cat("No mutations found in 3 or more variants.\n")
+}
+```
+
+## Interactive Mutation Explorer
+
+```{r simple_table}
+# Create simple table for detailed exploration
+mutations %>%
+  filter(type == "non-synonymous") %>%
+  select(variant, aa_change, aa_position, ref_aa, var_aa) %>%
+  arrange(variant, aa_position) %>%
+  head(50) %>%  # Show first 50 mutations
+  print()
+```
+
+---
+
+**Analysis Notes:**
+- This analysis compares the **first 10 spike protein sequences** from each variant file
+- Mutations are identified through global pairwise alignment (Needleman-Wunsch algorithm)
+- Only **non-synonymous mutations** (amino acid changes) are highlighted in visualizations
+- Mutation positions are now correctly calculated as integers (fixed from previous fractional positions)
+- The D614G mutation, if present, is a well-known mutation that increases viral transmission
