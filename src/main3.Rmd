@@ -1,0 +1,12 @@
+# Timeline de la propagación de Sars-Cov2
+
+El documento llevará este formato
+1. Título de la variante
+2. Gráfica de las mutaciones de interés y la frecuencia de dichas mutaciones en nuestro archivo .fasta
+3. explicación de qué representan dichas mutaciones
+
+##### Bonus:
+Analizar una variante específica que se haya adherido por medio de una gateway no convencional
+
+#### Primera variante de preocupación -- Wuhan
+
