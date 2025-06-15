@@ -1,5 +1,5 @@
-# Working directory
-setwd("/home/gero/Documents/projects/tec/biologia/project")
+# Working directory and dependencies
+setwd("/home/gero/Documents/projects/tec/biologia/project/src")
 
 # Cargar librerías
 library(seqinr)
@@ -16,15 +16,15 @@ registerDoFuture()
 # handlers(global = TRUE)
 
 # Archivos
-ref_file <- "wuhan.fasta"
+ref_file <- "../data/wuhan.fasta"
 variant_files <- c(
-                   "alpha.fasta",
-                   "beta.fasta",
-                   "gamma.fasta",
-                   "delta.fasta",
-                   "omicronba1.fasta",
-                   "omicronba2.fasta",
-                   "omicronjn1.fasta"
+                   "../data/alpha.fasta",
+                   "../data/beta.fasta",
+                   "../data/gamma.fasta",
+                   "../data/delta.fasta",
+                   "../data/omicronba1.fasta",
+                   "../data/omicronba2.fasta",
+                   "../data/omicronjn1.fasta"
 )
 
 #  Función para extraer glicoproteína de superficie
@@ -167,11 +167,12 @@ mutation_results <- foreach(file = variant_files, .combine = rbind) %do% {
         compare_sequences(ref_seq, var_seq, variant_name)
     }
 }
+
 mutations <- mutation_results
 
 
 #  Guardar resultados
-write.csv(mutations, "mutations_summary.csv", row.names = FALSE)
+write.csv(mutations, "../output/mutations_summary.csv", row.names = FALSE)
 
 #  Graficar las 10 mutaciones más frecuentes por variante
 top_mutations <- mutations %>%
